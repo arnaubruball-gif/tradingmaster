@@ -73,7 +73,7 @@ ASSETS = ['^GSPC', '^IXIC', '^DJI', 'BTC-USD', 'EURUSD=X', 'GC=F', 'CL=F']
 
 # --- 4. LÓGICA VIX (FIX PARA EVITAR VALUEERROR) ---
 try:
-    vix_raw = yf.download('^VIX', period='2d', interval='1d', progress=False)['Close']
+    vix_raw = yf.download('^VIX', period='2d', interval='1h', progress=False)['Close']
     # Extraemos valores como float puro (escalares)
     if isinstance(vix_raw, pd.DataFrame):
         vix_series = vix_raw.iloc[:, 0]
