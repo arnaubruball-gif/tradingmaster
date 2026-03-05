@@ -15,12 +15,10 @@ st.markdown("""
     .main { background-color: #050505; }
     .stMetric { background-color: #111111; padding: 15px; border-radius: 10px; border: 1px solid #222; }
     .metric-box { background-color: #0e1117; padding: 15px; border-radius: 8px; border: 1px solid #30363d; text-align: center; }
-    .signal-buy { background-color: #00ffcc; color: black; padding: 20px; border-radius: 10px; text-align: center; font-weight: bold; }
-    .signal-sell { background-color: #ff4b4b; color: white; padding: 20px; border-radius: 10px; text-align: center; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. MOTOR DE CÁLCULO (OPTIMIZADO SCALPING) ---
+# --- 2. MOTOR DE CÁLCULO (OPTIMIZADO) ---
 def calcular_hurst(ts):
     if len(ts) < 20: return 0.5
     lags = range(2, 15)
@@ -28,18 +26,24 @@ def calcular_hurst(ts):
     poly = np.polyfit(np.log(lags), np.log(tau), 1)
     return poly[0] * 2.0
 
-@st.cache_data(ttl=300) # Cache más corto para scalping
+@st.cache_data(ttl=300)
 def analyze_asset(ticker):
     try:
-        # Descarga rápida de 60 días para cálculos de corto plazo
-        df = yf.download(ticker, period='60d', interval='1d', progress=False)
-        if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        # Descarga forzando una sola columna para evitar MultiIndex
+        data = yf.download(ticker, period='60d', interval='1d', progress=False)
+        if data.empty: return None
         
-        # Indicadores Micro
+        # Limpieza de columnas (yfinance v0.2.40+ Fix)
+        if isinstance(data.columns, pd.MultiIndex):
+            df = data.copy()
+            df.columns = df.columns.get_level_values(0)
+        else:
+            df = data
+
+        # Indicadores de Microestructura
         df['Ret'] = df['Close'].pct_change()
         df['Vol_Proxy'] = (df['High'] - df['Low']) * 100000
-        df['RMF'] = df['Close'] * df['Vol_Proxy'] # Money Flow Residual
+        df['RMF'] = df['Close'] * df['Vol_Proxy'] 
         df['RVOL'] = df['Vol_Proxy'] / df['Vol_Proxy'].rolling(15).mean()
         
         # Z-DIFF (Presión de Flujo)
@@ -47,149 +51,130 @@ def analyze_asset(ticker):
         diff = df['Ret'].rolling(periodo_z).sum() - df['RMF'].pct_change().rolling(periodo_z).sum()
         z_series = (diff - diff.rolling(periodo_z).mean()) / (diff.rolling(periodo_z).std() + 1e-10)
         
-        # DIVERGENCIA DE SCALPING (Precio vs Flujo Real)
-        # Si el precio sube pero el flujo baja = Distribución (Venta)
-        price_mom = df['Close'].diff(3)
-        flow_mom = df['RMF'].diff(3)
-        div_val = 0 # Neutral
-        if price_mom.iloc[-1] > 0 and flow_mom.iloc[-1] < 0: div_val = -1 # Trampa alcista
-        elif price_mom.iloc[-1] < 0 and flow_mom.iloc[-1] > 0: div_val = 1 # Acumulación oculta
+        # Divergencia de Scalping
+        price_mom = df['Close'].diff(3).iloc[-1]
+        flow_mom = df['RMF'].diff(3).iloc[-1]
+        div_val = 0
+        if price_mom > 0 and flow_mom < 0: div_val = -1 # Venta (Precio sube sin volumen real)
+        elif price_mom < 0 and flow_mom > 0: div_val = 1 # Compra (Acumulación oculta)
 
         hurst = calcular_hurst(df['Close'].tail(30).values.flatten())
         
         return {
-            'df': df, 'price': float(df['Close'].iloc[-1]), 'z': z_series.iloc[-1], 
-            'z_series': z_series, 'hurst': hurst, 'vol': df['Ret'].tail(20).std(), 
-            'rvol': df['RVOL'].iloc[-1], 'div': div_val
+            'df': df, 'price': float(df['Close'].iloc[-1]), 'z': float(z_series.iloc[-1]), 
+            'z_series': z_series, 'hurst': hurst, 'vol': float(df['Ret'].tail(20).std()), 
+            'rvol': float(df['RVOL'].iloc[-1]), 'div': div_val
         }
-    except: return None
+    except Exception as e:
+        return None
 
-# --- 3. LISTA DE ACTIVOS (ÍNDICES Y FILTROS) ---
+# --- 3. LISTA DE ACTIVOS ---
 ASSETS = ['^GSPC', '^IXIC', '^DJI', 'BTC-USD', 'EURUSD=X', 'GC=F', 'CL=F']
 
-# --- 4. INTERFAZ ---
-st.title("⚡ JDetector Pro: Scalping & Institutional Edge")
+# --- 4. LÓGICA VIX (FIX PARA EVITAR VALUEERROR) ---
+try:
+    vix_raw = yf.download('^VIX', period='2d', interval='1d', progress=False)['Close']
+    # Extraemos valores como float puro (escalares)
+    if isinstance(vix_raw, pd.DataFrame):
+        vix_series = vix_raw.iloc[:, 0]
+    else:
+        vix_series = vix_raw
+        
+    vix_now = float(vix_series.iloc[-1])
+    vix_prev = float(vix_series.iloc[-2])
+    vix_status = "🔴 RIESGO (VIX ↑)" if vix_now > vix_prev else "🟢 CALMA (VIX ↓)"
+except:
+    vix_now, vix_prev, vix_status = 20.0, 20.0, "N/A"
 
-# Sidebar para Gestión de Riesgo
+# --- 5. INTERFAZ ---
+st.title("⚡ JDetector Pro: Sniper Scalper")
+
 with st.sidebar:
     st.header("💰 Risk Manager")
     balance = st.number_input("Balance Cuenta ($)", value=10000)
-    risk_per_trade = st.slider("Riesgo por Operación (%)", 0.5, 5.0, 1.0)
-    st.markdown("---")
-    st.write("El sistema utiliza el **Criterio de Kelly** para ajustar el tamaño según la probabilidad de éxito.")
+    risk_pct = st.slider("Riesgo Máximo por Operación (%)", 0.5, 5.0, 1.0)
+    st.info(f"VIX Actual: {vix_now:.2f}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 SNIPER SCAN", "🎲 PROBABILIDAD", "📊 FLUJO (RMF)", "🏛️ MACRO FILTERS", "⚖️ BEER MODEL"])
-
-# --- LÓGICA VIX (FILTRO DE PÁNICO) ---
-try:
-    vix_df = yf.download('^VIX', period='2d', interval='1d', progress=False)['Close']
-    vix_now = vix_df.iloc[-1]
-    vix_prev = vix_df.iloc[-2]
-    vix_status = "🔴 ALERTA: Miedo Subiendo" if vix_now > vix_prev else "🟢 CALMA: VIX Bajando"
-except:
-    vix_now, vix_status = 20, "N/A"
+tab1, tab2, tab3, tab4 = st.tabs(["🚀 SCANNER", "🎲 PROBABILIDAD", "🌊 FLUJO RMF", "⚖️ BEER MACRO"])
 
 with tab1:
-    st.subheader(f"📡 Escaneo en Tiempo Real | VIX: {vix_now:.2f} ({vix_status})")
+    st.subheader(f"📡 Escaneo Institucional | {vix_status}")
     if st.button('🔍 INICIAR ESCANEO ADN'):
         results = []
         for t in ASSETS:
             d = analyze_asset(t)
             if d:
-                # Lógica de Veredicto combinando ADN + Divergencia
+                # Lógica de Veredicto
                 status = "⚪ NEUTRAL"
                 if d['z'] < -1.5 and d['div'] >= 0: status = "🟢 COMPRA"
                 elif d['z'] > 1.5 and d['div'] <= 0: status = "🚨 VENTA"
                 
-                # Filtro VIX para Índices
+                # Filtro de seguridad VIX para índices
                 if "^" in t and vix_now > vix_prev and "COMPRA" in status:
                     status = "🟡 COMPRA (Riesgo VIX)"
 
                 results.append([t, f"{d['price']:.2f}", f"{d['z']:.2f}", f"{d['hurst']:.2f}", d['div'], status])
         
-        res_df = pd.DataFrame(results, columns=['Activo', 'Precio', 'Z-Diff', 'Hurst', 'Div. Flujo', 'Veredicto'])
-        st.dataframe(res_df.style.applymap(lambda x: 'color: #00ffcc' if 'COMPRA' in str(x) else ('color: #ff4b4b' if 'VENTA' in str(x) else ''), subset=['Veredicto']), use_container_width=True)
+        df_res = pd.DataFrame(results, columns=['Activo', 'Precio', 'Z-Diff', 'Hurst', 'Div. Flujo', 'Veredicto'])
+        st.table(df_res)
 
 with tab2:
-    st.subheader("🎲 Análisis de Probabilidad (Montecarlo 15d)")
-    target_m = st.selectbox("Seleccionar Activo:", ASSETS, key="mc_s")
+    st.subheader("🎲 Montecarlo & Kelly Criterion")
+    target_m = st.selectbox("Seleccionar Activo:", ASSETS)
     dm = analyze_asset(target_m)
     if dm:
+        # Simulación
         sims, dias = 1000, 15 
         rets = np.random.normal(dm['df']['Ret'].mean(), dm['vol'], (sims, dias))
         caminos = dm['price'] * (1 + rets).cumprod(axis=1)
         
+        # Probabilidad según Z-Diff
         exitos = (caminos[:, -1] > dm['price']).sum() if dm['z'] <= 0 else (caminos[:, -1] < dm['price']).sum()
         prob = (exitos / sims) * 100
         
-        # CÁLCULO KELLY PARA SCALPING
-        k_perc = max(0, ((prob/100) * 1.5 - 0.5)) # Asumiendo R:R 1:1.5
+        # Criterio de Kelly (f = p - q/b)
+        kelly = max(0, ((prob/100) * 1.5 - 0.5)) 
         
         c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Probabilidad de Éxito", f"{prob:.1f}%")
-            st.metric("Sugerencia Kelly", f"{k_perc*100:.1f}% del capital")
-        with c2:
-            st.write(f"**Lotes Sugeridos:** {(balance * k_perc) / (dm['price'] * 0.01):.2f}")
-            st.write(f"**Stop Loss (ATR):** {dm['price'] * (1 - dm['vol']):.2f}")
-
-        fig_m = go.Figure()
-        for i in range(15): fig_m.add_trace(go.Scatter(y=caminos[i], line=dict(width=1), opacity=0.1, showlegend=False))
-        fig_m.add_trace(go.Scatter(y=np.percentile(caminos, 50, axis=0), line=dict(color="#00ffcc", width=3), name="Mediana"))
-        st.plotly_chart(fig_m.update_layout(template="plotly_dark", height=350), use_container_width=True)
+        c1.metric("Probabilidad Éxito", f"{prob:.1f}%")
+        c2.metric("Sugerencia Kelly", f"{kelly*100:.1f}%")
+        
+        fig = go.Figure()
+        for i in range(10): fig.add_trace(go.Scatter(y=caminos[i], line=dict(width=1), opacity=0.2, showlegend=False))
+        fig.add_trace(go.Scatter(y=np.median(caminos, axis=0), line=dict(color="#00ffcc", width=3), name="Tendencia Central"))
+        st.plotly_chart(fig.update_layout(template="plotly_dark", height=300), use_container_width=True)
 
 with tab3:
-    st.subheader("🌊 Shadow Money Flow (Institutional Activity)")
-    target_b = st.selectbox("Analizar RMF:", ASSETS, key="b_s")
-    db = analyze_asset(target_b)
-    if db:
-        df_b = db['df'].copy()
-        # Detectar Anomalías de Volumen (Smart Money)
-        df_b['Anom'] = df_b['RMF'].abs() / df_b['RMF'].abs().rolling(20).mean()
-        colors = ['#00ffcc' if x > 2.0 else '#333' for x in df_b['Anom']]
+    st.subheader("🌊 Residual Money Flow (RMF)")
+    target_f = st.selectbox("Monitor de Flujo:", ASSETS, key="flujo")
+    dflow = analyze_asset(target_f)
+    if dflow:
+        # Detectamos anomalías de volumen institucional
+        anomalia = dflow['df']['RMF'].abs() / dflow['df']['RMF'].abs().rolling(20).mean()
+        colores = ['#00ffcc' if x > 2.0 else '#333' for x in anomalia]
         
-        st.plotly_chart(go.Figure(data=[go.Bar(x=df_b.index, y=df_b['RMF'], marker_color=colors)]).update_layout(template="plotly_dark", title="Money Flow Residual (Barras verdes = Actividad Institucional)"), use_container_width=True)
+        fig_flow = go.Figure(go.Bar(x=dflow['df'].index, y=dflow['df']['RMF'], marker_color=colores))
+        st.plotly_chart(fig_flow.update_layout(template="plotly_dark", title="Barras turquesa = Actividad Institucional Inusual"), use_container_width=True)
 
 with tab4:
-    st.subheader("🏛️ Institutional COT & Vol-Monitor")
-    # Monitor de Eficiencia de Kaufman
-    target_v = st.selectbox("Efficiency Ratio:", ASSETS, key="v_s")
-    dv = analyze_asset(target_v)
-    if dv:
-        change = abs(dv['df']['Close'] - dv['df']['Close'].shift(10))
-        volat = abs(dv['df']['Close'] - dv['df']['Close'].shift(1)).rolling(10).sum()
-        er = (change / (volat + 1e-10)).iloc[-1]
-        
-        m1, m2, m3 = st.columns(3)
-        m1.metric("RVOL (Volumen Relativo)", f"{dv['rvol']:.2f}x")
-        m2.metric("Efficiency Ratio", f"{er:.2f}")
-        m3.metric("Hurst Exponent", f"{dv['hurst']:.2f}")
-        
-        if er > 0.6: st.success("🚀 Tendencia Altamente Eficiente")
-        else: st.warning("🌀 Mercado en Rango / Ruido")
-
-with tab5:
-    st.subheader("⚖️ BEER Model (Forex/Index Equilibrium)")
-    pair_beer = st.selectbox("Par/Activo:", ['EURUSD=X', 'GBPUSD=X', '^GSPC'], key="sb_beer")
+    st.subheader("⚖️ BEER Model Equilibrium")
+    pair = st.selectbox("Activo Macro:", ['EURUSD=X', '^GSPC'], key="macro")
     try:
-        bond_ref = yf.download('^TNX', period='60d', interval='1d', progress=False)['Close']
-        price_ref = yf.download(pair_beer, period='60d', interval='1d', progress=False)['Close']
+        bond = yf.download('^TNX', period='60d', progress=False)['Close']
+        price = yf.download(pair, period='60d', progress=False)['Close']
         
-        df_beer = pd.concat([bond_ref, price_ref], axis=1).dropna()
-        df_beer.columns = ['Bond', 'Price']
-        df_beer['Bond_N'] = (df_beer['Bond'] - df_beer['Bond'].rolling(20).mean()) / df_beer['Bond'].rolling(20).std()
-        df_beer['Price_N'] = (df_beer['Price'] - df_beer['Price'].rolling(20).mean()) / df_beer['Price'].rolling(20).std()
+        # Sincronización
+        df_b = pd.concat([bond, price], axis=1).dropna()
+        df_b.columns = ['Bond', 'Price']
         
-        actual_desv = df_beer['Price_N'].iloc[-1] - df_beer['Bond_N'].iloc[-1]
+        # Normalización Z-Score
+        z_p = (df_b['Price'] - df_b['Price'].rolling(20).mean()) / df_b['Price'].rolling(20).std()
+        z_b = (df_b['Bond'] - df_b['Bond'].rolling(20).mean()) / df_b['Bond'].rolling(20).std()
         
-        st.metric("Desviación BEER", f"{actual_desv:.2f}", 
-                  delta="SOBREVALORADO" if actual_desv > 1.2 else "INFRAVALORADO" if actual_desv < -1.2 else "FAIR VALUE")
-        
-        fig_p = go.Figure()
-        fig_p.add_trace(go.Scatter(x=df_beer.index, y=df_beer['Price_N'], name="Precio (Norm)"))
-        fig_p.add_trace(go.Scatter(x=df_beer.index, y=df_beer['Bond_N'], name="Yield 10Y (Norm)", line=dict(dash='dot')))
-        st.plotly_chart(fig_p.update_layout(template="plotly_dark"), use_container_width=True)
-    except: st.error("Error cargando datos macro.")
+        desv = float(z_p.iloc[-1] - z_b.iloc[-1])
+        st.metric("Desviación BEER", f"{desv:.2f}", delta="Sobrevalorado" if desv > 1 else "Infravalorado" if desv < -1 else "Fair Value")
+    except:
+        st.warning("Datos macro no disponibles temporalmente.")
 
 st.markdown("---")
-st.caption("JDetector Pro | Use bajo su propio riesgo. El scalping requiere ejecución inmediata.")
+st.caption("JDetector Sniper v2.0 - Corregido para Pandas Scalar Logic")
